@@ -1058,16 +1058,28 @@ function DayEditModal({ date, record, shifts, defaultShift, onClose, onSave, onD
 
 function normalizeDate(dateStr) {
   if (!dateStr) return "";
+
+  // XLSX date cells can arrive as JS Date objects (when read with cellDates:true).
+  // Format those as DD-MM-YYYY text first, then fall through to the string parsing below.
+  if (dateStr instanceof Date && !isNaN(dateStr)) {
+    dateStr = `${pad2(dateStr.getDate())}-${pad2(dateStr.getMonth() + 1)}-${dateStr.getFullYear()}`;
+  }
+
   dateStr = String(dateStr).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+
+  // Primary expected format: DD-MM-YYYY
   if (/^\d{2}-\d{2}-\d{4}$/.test(dateStr)) {
     const [dd, mm, yyyy] = dateStr.split("-");
     return `${yyyy}-${mm}-${dd}`;
   }
+  // Also accepted: DD/MM/YYYY
   if (/^\d{2}\/\d{2}\/\d{4}$/.test(dateStr)) {
     const [dd, mm, yyyy] = dateStr.split("/");
     return `${yyyy}-${mm}-${dd}`;
   }
+  // Still accepted for backwards compatibility with older exports: YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return dateStr;
+
   return "";
 }
 
@@ -1077,46 +1089,75 @@ function ImportModal({ employee, shifts, onClose, onImport }) {
   const [err, setErr] = useState("");
   const fileRef = useRef(null);
 
+  // Shared row -> record normalizer, used for both CSV rows (from papaparse)
+  // and XLSX/XLS rows (from SheetJS) so downstream logic stays identical.
+  const normalizeRows = (rawRows) => {
+    try {
+      const parsed = rawRows.map((row) => {
+        const date = normalizeDate(row.Date ?? row.date ?? "");
+        const isWO = /wo|week ?off/i.test(row.Shift || row.dayType || "");
+        return {
+          date,
+          dayType: isWO ? "weekoff" : "working",
+          shiftCode: row.Shift && shifts.find((s) => s.code === row.Shift) ? row.Shift : (shifts[0]?.code || ""),
+          firstIn: String(row["First IN"] ?? row.firstIn ?? "").trim(),
+          lastOut: String(row["Last OUT"] ?? row.lastOut ?? "").trim(),
+          breakMinutes: Number(row.Break || row.breakMinutes || 0) || 0,
+          remark: row.Remark || row.remark || "",
+        };
+      }).filter((r) => r.date !== "");
+      setRows(parsed);
+      if (parsed.length === 0) setErr("No valid rows found. Supported date formats: DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD.");
+    } catch (e) { setErr("Could not read that file."); }
+  };
+
   const handleFile = (file) => {
     setFileName(file.name);
     setErr("");
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      complete: (res) => {
+    const ext = file.name.split(".").pop().toLowerCase();
+
+    if (ext === "csv") {
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: (res) => normalizeRows(res.data),
+        error: () => setErr("Could not read that file."),
+      });
+    } else if (ext === "xlsx" || ext === "xls") {
+      const reader = new FileReader();
+      reader.onload = (e) => {
         try {
-          const parsed = res.data.map((row) => {
-            const date = normalizeDate(row.Date || row.date || "");
-            const isWO = /wo|week ?off/i.test(row.Shift || row.dayType || "");
-            return {
-              date,
-              dayType: isWO ? "weekoff" : "working",
-              shiftCode: row.Shift && shifts.find((s) => s.code === row.Shift) ? row.Shift : (shifts[0]?.code || ""),
-              firstIn: (row["First IN"] || row.firstIn || "").trim(),
-              lastOut: (row["Last OUT"] || row.lastOut || "").trim(),
-              breakMinutes: Number(row.Break || row.breakMinutes || 0) || 0,
-              remark: row.Remark || row.remark || "",
-            };
-          }).filter((r) => r.date !== "");
-          setRows(parsed);
-          if (parsed.length === 0) setErr("No valid rows found. Supported formats: YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY.");
-        } catch (e) { setErr("Could not read that file."); }
-      },
-      error: () => setErr("Could not read that file."),
-    });
+          const data = new Uint8Array(e.target.result);
+          // cellDates:true turns date-formatted cells into JS Date objects instead
+          // of Excel's serial-number form, so normalizeDate can format them itself.
+          const wb = XLSX.read(data, { type: "array", cellDates: true });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          // dateNF forces any date cell that SheetJS stringifies to DD-MM-YYYY text;
+          // raw:false also renders numbers/times as their displayed text, defval fills blanks.
+          const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: "", raw: false, dateNF: "dd-mm-yyyy" });
+          normalizeRows(rawRows);
+        } catch (e) {
+          setErr("Could not read that file.");
+        }
+      };
+      reader.onerror = () => setErr("Could not read that file.");
+      reader.readAsArrayBuffer(file);
+    } else {
+      setErr("Unsupported file type. Please upload a .csv, .xlsx or .xls file.");
+    }
   };
 
   return (
     <Modal title={`Import punches — ${employee.name}`} onClose={onClose} wide>
       <div style={{ fontSize: 12.5, color: "#6B6656", marginBottom: 10, lineHeight: 1.6 }}>
-        CSV columns expected: <code>Date</code> (YYYY-MM-DD), <code>Shift</code> (shift code, or contains "WO" for week off),
+        CSV or Excel columns expected: <code>Date</code> (DD-MM-YYYY), <code>Shift</code> (shift code, or contains "WO" for week off),
         <code> First IN</code>, <code>Last OUT</code>, optional <code>Break</code> (minutes) and <code>Remark</code>.
       </div>
       <div style={S.dropZone} onClick={() => fileRef.current?.click()}>
         <Upload size={18} />
-        <div style={{ marginTop: 6, fontSize: 13 }}>{fileName || "Click to choose a .csv file"}</div>
+        <div style={{ marginTop: 6, fontSize: 13 }}>{fileName || "Click to choose a .csv or .xlsx file"}</div>
       </div>
-      <input ref={fileRef} type="file" accept=".csv" style={{ display: "none" }}
+      <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{ display: "none" }}
         onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])} />
       {err && <div style={{ color: "#A63A2E", fontSize: 12.5, marginTop: 8 }}>{err}</div>}
       {rows.length > 0 && (
