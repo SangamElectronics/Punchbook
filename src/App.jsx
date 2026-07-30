@@ -200,6 +200,8 @@ function summarize(calcRows) {
     totalWorkHours: 0, totalExtraWork: 0, totalSpecialAddition: 0, totalAddition: 0, totalDeduction: 0,
     weekOffWorkedCount: 0, totalWeekOffOT: 0,
   };
+  const additionDates = [];   // days "Absent (Worked <threshold)" whose hours are credited to Addition
+  const weekOffOtDates = [];  // days worked on a Week Off, credited as OT (1x)
   for (const r of calcRows) {
     if (r.dayStatus === "Present") s.presentDays++;
     else if (r.dayStatus === "Half Day") s.halfDays++;
@@ -209,7 +211,13 @@ function summarize(calcRows) {
     else if (r.dayStatus === "Week Off") s.weekOffDays++;
     if (r.lateInH > 0) { s.lateCount++; s.totalLateHours += r.lateInH; }
     if (r.earlyOutH > 0) { s.earlyCount++; s.totalEarlyHours += r.earlyOutH; }
-    if (r.weekOffWorkedHours > 0) { s.weekOffWorkedCount++; s.totalWeekOffOT += r.weekOffWorkedHours; }
+    if (r.weekOffWorkedHours > 0) {
+      s.weekOffWorkedCount++; s.totalWeekOffOT += r.weekOffWorkedHours;
+      weekOffOtDates.push({ date: r.date, hours: round2(r.weekOffWorkedHours) });
+    }
+    if (r.dayStatus === "Absent (Short Hours)" && r.specialAddition > 0) {
+      additionDates.push({ date: r.date, hours: round2(r.specialAddition) });
+    }
     s.totalWorkHours += r.workHours;
     s.totalExtraWork += r.extraWork;
     s.totalSpecialAddition += r.specialAddition;
@@ -218,6 +226,9 @@ function summarize(calcRows) {
   }
   s.totalAbsent = s.absentShort + s.absentNoPunch;
   s.workingDays = s.totalDays - s.weekOffDays - s.onLeave;
+  // Matches the Excel Summary sheet's "Total Working Days (Total Days - Week Off)" exactly
+  // (that sheet has no separate Leave concept, so it only ever subtracts Week Off).
+  s.totalWorkingDaysStrict = s.totalDays - s.weekOffDays;
   s.finalAttendance = s.presentDays + s.halfDays * 0.5;
   s.attendancePct = s.workingDays > 0 ? round2((s.finalAttendance / s.workingDays) * 100) : 0;
   s.netHours = round2(s.totalAddition - s.totalDeduction);
@@ -229,6 +240,13 @@ function summarize(calcRows) {
   s.totalAddition = round2(s.totalAddition);
   s.totalDeduction = round2(s.totalDeduction);
   s.totalWeekOffOT = round2(s.totalWeekOffOT);
+  s.additionDates = additionDates;
+  s.weekOffOtDates = weekOffOtDates;
+  // Excel's "Reconciliation Check": Present + Half + Absent vs Total Working Days.
+  // On Leave is folded in on the "accounted for" side since this app (unlike the sheet) has a Leave day type.
+  const accountedDays = s.presentDays + s.halfDays + s.totalAbsent + s.onLeave;
+  s.reconciliationDiff = accountedDays - s.totalWorkingDaysStrict;
+  s.reconciliationOk = s.reconciliationDiff === 0;
   return s;
 }
 
@@ -1237,20 +1255,49 @@ function ReportsView({ config, shiftByCode, ensureMonthLoaded, attnCache }) {
       Employee: r.employeeName, Code: r.employeeCode, Date: r.date, Day: weekdayShort(r.date),
       Type: r.dayType, "First In": r.firstIn, "Last Out": r.lastOut, "Work Hours": hoursToHM(r.workHours),
       "Late In": hoursToHM(r.lateInH), "Early Out": hoursToHM(r.earlyOutH), "Extra Work": hoursToHM(r.extraWork),
+      "Special Addition": hoursToHM(r.specialAddition), "Total Addition": hoursToHM(r.totalAddition),
+      "Total Deduction": hoursToHM(r.totalDeduction), "Net": hoursToHM(r.net),
+      "Week-Off OT (1x)": r.weekOffWorkedHours > 0 ? hoursToHM(r.weekOffWorkedHours) : "",
       Status: r.dayStatus, Remark: r.remark || "",
     }));
     const ws = XLSX.utils.json_to_sheet(sheetRows);
     XLSX.utils.book_append_sheet(wb, ws, "Daily Detail");
 
     const summaryRows = perEmpSummary.map(({ name, sum }) => ({
-      Employee: name, "Total Days": sum.totalDays, Present: sum.presentDays, "Half Day": sum.halfDays,
-      Absent: sum.totalAbsent, "Week Off": sum.weekOffDays, "Attendance %": sum.attendancePct,
-      "Late Count": sum.lateCount, "Late Hours": hoursToHM(sum.totalLateHours),
-      "Early Count": sum.earlyCount, "Early Hours": hoursToHM(sum.totalEarlyHours),
-      "Overtime Hours": hoursToHM(sum.totalExtraWork + sum.totalWeekOffOT), "Net Hours": hoursToHM(sum.netHours),
+      Employee: name,
+      "Total Days": sum.totalDays,
+      "Present Days (Full)": sum.presentDays,
+      "Half Days": sum.halfDays,
+      "Absent - Worked <Threshold": sum.absentShort,
+      "Absent - No Punches": sum.absentNoPunch,
+      "Total Absent Days": sum.totalAbsent,
+      "Week Off Days": sum.weekOffDays,
+      "Total Working Days (Total-WeekOff)": sum.totalWorkingDaysStrict,
+      "Reconciliation Check": sum.reconciliationOk ? "OK" : `Mismatch (${sum.reconciliationDiff > 0 ? "+" : ""}${sum.reconciliationDiff})`,
+      "Final Attendance (Half=0.5)": sum.finalAttendance,
+      "Attendance %": sum.attendancePct,
+      "Total Late-IN Hours": hoursToHM(sum.totalLateHours),
+      "Total Early-OUT Hours": hoursToHM(sum.totalEarlyHours),
+      "Total Extra Work Hours": hoursToHM(sum.totalExtraWork),
+      "Total Special Addition Hours": hoursToHM(sum.totalSpecialAddition),
+      "TOTAL ADDITION HOURS": hoursToHM(sum.totalAddition),
+      "TOTAL DEDUCTION HOURS": hoursToHM(sum.totalDeduction),
+      "Net (Addition-Deduction)": hoursToHM(sum.netHours),
+      "Week Off Days Worked (Count)": sum.weekOffWorkedCount,
+      "Total OT (1x) Hours - Week Off": hoursToHM(sum.totalWeekOffOT),
     }));
     const ws2 = XLSX.utils.json_to_sheet(summaryRows);
     XLSX.utils.book_append_sheet(wb, ws2, "Summary");
+
+    const additionRows = perEmpSummary.flatMap(({ name, sum }) =>
+      sum.additionDates.map((d) => ({ Employee: name, Date: d.date, "Hours Added": hoursToHM(d.hours) })));
+    const ws3 = XLSX.utils.json_to_sheet(additionRows.length ? additionRows : [{ Employee: "", Date: "None this period", "Hours Added": "" }]);
+    XLSX.utils.book_append_sheet(wb, ws3, "Addition Dates");
+
+    const weekOffOtRows = perEmpSummary.flatMap(({ name, sum }) =>
+      sum.weekOffOtDates.map((d) => ({ Employee: name, Date: d.date, "OT (1x) Hours": hoursToHM(d.hours) })));
+    const ws4 = XLSX.utils.json_to_sheet(weekOffOtRows.length ? weekOffOtRows : [{ Employee: "", Date: "None this period", "OT (1x) Hours": "" }]);
+    XLSX.utils.book_append_sheet(wb, ws4, "Week-Off OT Dates");
 
     XLSX.writeFile(wb, `attendance-report_${start}_to_${end}.xlsx`);
   };
@@ -1290,8 +1337,11 @@ function ReportsView({ config, shiftByCode, ensureMonthLoaded, attnCache }) {
       </div>
 
       <div id="print-area" ref={printRef}>
-        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#8A8371", marginBottom: 10 }}>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#8A8371", marginBottom: 4 }}>
           {start} — {end} · {targetEmployees.length} employee{targetEmployees.length !== 1 ? "s" : ""} · {loadedRows.length} recorded days
+        </div>
+        <div style={{ fontFamily: "'IBM Plex Mono', monospace", fontSize: 11, color: "#8A8371", marginBottom: 10 }}>
+          Grace: {settings.graceMinutes}m · Default full day: {hoursToHM(settings.fullDayHours)} · Default half day: {hoursToHM(settings.halfDayHours)} (per-shift overrides apply where set)
         </div>
 
         <div style={S.cardGrid}>
@@ -1301,45 +1351,115 @@ function ReportsView({ config, shiftByCode, ensureMonthLoaded, attnCache }) {
           <StatCard label="Late arrivals" value={overall.lateCount} sub={hoursToHM(overall.totalLateHours)} />
           <StatCard label="Early departures" value={overall.earlyCount} sub={hoursToHM(overall.totalEarlyHours)} />
           <StatCard label="Overtime" value={hoursToHM(overall.totalExtraWork + overall.totalWeekOffOT)} />
+          <StatCard label="Addition hours" value={hoursToHM(overall.totalAddition)} accent="#2F6F4E" sub={`incl. ${hoursToHM(overall.totalSpecialAddition)} special`} />
+          <StatCard label="Deduction hours" value={hoursToHM(overall.totalDeduction)} accent="#A63A2E" />
+          <StatCard
+            label="Reconciliation"
+            value={overall.reconciliationOk ? "OK" : "Mismatch"}
+            accent={overall.reconciliationOk ? "#2F6F4E" : "#A63A2E"}
+            sub={overall.reconciliationOk ? "Present+Half+Absent = Working days" : `Off by ${overall.reconciliationDiff > 0 ? "+" : ""}${overall.reconciliationDiff} day(s)`}
+          />
         </div>
 
         <div style={S.card}>
           <div style={S.cardTitle}>Summary by employee</div>
-          <table style={S.table}>
-            <thead>
-              <tr>
-                <th style={S.th}>Employee</th><th style={S.th}>Present</th><th style={S.th}>Half</th>
-                <th style={S.th}>Absent</th><th style={S.th}>Week off</th><th style={S.th}>Attendance %</th>
-                <th style={S.th}>Late</th><th style={S.th}>Early</th><th style={S.th}>OT hrs</th><th style={S.th}>Net hrs</th>
-              </tr>
-            </thead>
-            <tbody>
-              {perEmpSummary.map(({ name, sum }) => (
-                <tr key={name}>
-                  <td style={S.td}><b>{name}</b></td>
-                  <td style={S.tdMono}>{sum.presentDays}</td>
-                  <td style={S.tdMono}>{sum.halfDays}</td>
-                  <td style={S.tdMono}>{sum.totalAbsent}</td>
-                  <td style={S.tdMono}>{sum.weekOffDays}</td>
-                  <td style={S.tdMono}><b>{sum.attendancePct}%</b></td>
-                  <td style={S.tdMono}>{sum.lateCount}</td>
-                  <td style={S.tdMono}>{sum.earlyCount}</td>
-                  <td style={S.tdMono}>{hoursToHM(sum.totalExtraWork + sum.totalWeekOffOT)}</td>
-                  <td style={S.tdMono}>{hoursToHM(sum.netHours)}</td>
+          <div style={S.tableScroll}>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  <th style={S.th}>Employee</th><th style={S.th}>Total days</th><th style={S.th}>Present</th><th style={S.th}>Half</th>
+                  <th style={S.th}>Absent</th><th style={S.th}>Week off</th><th style={S.th}>Working days</th>
+                  <th style={S.th}>Final attn.</th><th style={S.th}>Attendance %</th>
+                  <th style={S.th}>Late</th><th style={S.th}>Early</th>
+                  <th style={S.th}>Special addn.</th><th style={S.th}>Addn. hrs</th><th style={S.th}>Dedn. hrs</th>
+                  <th style={S.th}>Net hrs</th><th style={S.th}>WO worked</th><th style={S.th}>WO OT hrs</th>
+                  <th style={S.th}>Reconciliation</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {perEmpSummary.map(({ name, sum }) => (
+                  <tr key={name}>
+                    <td style={S.td}><b>{name}</b></td>
+                    <td style={S.tdMono}>{sum.totalDays}</td>
+                    <td style={S.tdMono}>{sum.presentDays}</td>
+                    <td style={S.tdMono}>{sum.halfDays}</td>
+                    <td style={S.tdMono}>{sum.totalAbsent}</td>
+                    <td style={S.tdMono}>{sum.weekOffDays}</td>
+                    <td style={S.tdMono}>{sum.totalWorkingDaysStrict}</td>
+                    <td style={S.tdMono}>{sum.finalAttendance}</td>
+                    <td style={S.tdMono}><b>{sum.attendancePct}%</b></td>
+                    <td style={S.tdMono}>{sum.lateCount}</td>
+                    <td style={S.tdMono}>{sum.earlyCount}</td>
+                    <td style={S.tdMono}>{hoursToHM(sum.totalSpecialAddition)}</td>
+                    <td style={S.tdMono}>{hoursToHM(sum.totalAddition)}</td>
+                    <td style={S.tdMono}>{hoursToHM(sum.totalDeduction)}</td>
+                    <td style={S.tdMono}>{hoursToHM(sum.netHours)}</td>
+                    <td style={S.tdMono}>{sum.weekOffWorkedCount}</td>
+                    <td style={S.tdMono}>{hoursToHM(sum.totalWeekOffOT)}</td>
+                    <td style={S.td}>
+                      {sum.reconciliationOk
+                        ? <span style={{ color: "#2F6F4E", fontSize: 11, fontWeight: 600 }}>OK</span>
+                        : <span style={{ color: "#A63A2E", fontSize: 11, fontWeight: 600 }}>{sum.reconciliationDiff > 0 ? "+" : ""}{sum.reconciliationDiff}</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>Additions — days worked below the half-day threshold</div>
+          <div style={{ fontSize: 11.5, color: "#8A8371", marginBottom: 10 }}>
+            These days still count as Absent for attendance purposes, but the hours actually worked on them are credited into Total Addition Hours above.
+          </div>
+          {perEmpSummary.every(({ sum }) => sum.additionDates.length === 0) ? (
+            <EmptyState text="None in this period." />
+          ) : (
+            perEmpSummary.map(({ name, sum }) => sum.additionDates.length > 0 && (
+              <div key={name} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 5 }}>{name}</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {sum.additionDates.map((d) => (
+                    <span key={d.date} style={S.chip}>{d.date} · {hoursToHM(d.hours)}</span>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>Week-Off days worked — OT (1×)</div>
+          <div style={{ fontSize: 11.5, color: "#8A8371", marginBottom: 10 }}>
+            Days still counted as Week Off for attendance purposes, with the hours actually worked pulled out separately as OT (1×).
+          </div>
+          {perEmpSummary.every(({ sum }) => sum.weekOffOtDates.length === 0) ? (
+            <EmptyState text="None in this period." />
+          ) : (
+            perEmpSummary.map(({ name, sum }) => sum.weekOffOtDates.length > 0 && (
+              <div key={name} style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 5 }}>{name}</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {sum.weekOffOtDates.map((d) => (
+                    <span key={d.date} style={S.chip}>{d.date} · {hoursToHM(d.hours)} OT</span>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
         </div>
 
         <div style={S.card}>
           <div style={S.cardTitle}>Daily detail</div>
           {loadedRows.length === 0 ? <EmptyState text="No records in this range yet." /> : (
+            <div style={S.tableScroll}>
             <table style={S.table}>
               <thead>
                 <tr>
                   <th style={S.th}>Employee</th><th style={S.th}>Date</th><th style={S.th}>In</th><th style={S.th}>Out</th>
-                  <th style={S.th}>Work hrs</th><th style={S.th}>Late</th><th style={S.th}>Early</th><th style={S.th}>Status</th>
+                  <th style={S.th}>Work hrs</th><th style={S.th}>Late</th><th style={S.th}>Early</th>
+                  <th style={S.th}>Addn.</th><th style={S.th}>Dedn.</th><th style={S.th}>Net</th><th style={S.th}>Status</th>
                 </tr>
               </thead>
               <tbody>
@@ -1352,11 +1472,15 @@ function ReportsView({ config, shiftByCode, ensureMonthLoaded, attnCache }) {
                     <td style={S.tdMono}>{hoursToHM(r.workHours)}</td>
                     <td style={S.tdMono}>{r.lateInH > 0 ? hoursToHM(r.lateInH) : "—"}</td>
                     <td style={S.tdMono}>{r.earlyOutH > 0 ? hoursToHM(r.earlyOutH) : "—"}</td>
+                    <td style={S.tdMono}>{r.totalAddition > 0 ? hoursToHM(r.totalAddition) : "—"}</td>
+                    <td style={S.tdMono}>{r.totalDeduction > 0 ? hoursToHM(r.totalDeduction) : "—"}</td>
+                    <td style={S.tdMono}>{hoursToHM(r.net)}</td>
                     <td style={S.td}><Stamp status={r.dayStatus} small /></td>
                   </tr>
                 ))}
               </tbody>
             </table>
+            </div>
           )}
         </div>
       </div>
@@ -1607,6 +1731,12 @@ const S = {
     border: "1.5px dashed #DED9CA", borderRadius: 5, padding: "26px 10px", textAlign: "center",
     color: "#8A8371", cursor: "pointer", background: "#FBFAF6",
   },
+  chip: {
+    display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 11, color: "#3A362C", background: "#F1EEE3", border: "1px solid #E4DFD0",
+    borderRadius: 3, padding: "3px 8px",
+  },
+  tableScroll: { width: "100%", overflowX: "auto" },
 };
 
 /* stamp + print styles injected once */
